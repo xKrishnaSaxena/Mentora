@@ -12,6 +12,7 @@ import re
 import logging
 from aiohttp import web, WSMsgType
 import jwt
+import edge_tts
 import bcrypt
 from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime, timezone, timedelta
@@ -104,18 +105,38 @@ def clean_text(text: str) -> str:
     text = re.sub(r"`(.*?)`", r"\1", text)
     return text.strip()
 
-async def text_to_speech(text: str):
+async def _tts_edge(text, voice="en-US-GuyNeural", rate="-10%", pitch="-8Hz"):
+    communicate = edge_tts.Communicate(text, voice=voice, rate=rate, pitch=pitch)
+    b = bytearray()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            b.extend(chunk["data"])
+    return base64.b64encode(bytes(b)).decode("utf-8")
+
+async def text_to_speech(text: str, tts_opts=None):
+    provider = (tts_opts or {}).get("provider") or os.getenv("TTS_PROVIDER", "edge")
     try:
-        tts = gTTS(text=text, lang="en")
-        mp3_fp = io.BytesIO()
-        tts.write_to_fp(mp3_fp)
-        mp3_fp.seek(0)
-        audio_data = base64.b64encode(mp3_fp.read()).decode("utf-8")
-        logger.info("Audio generated successfully")
-        return audio_data
+        if provider == "edge":
+            voice = (tts_opts or {}).get("voice", "en-US-GuyNeural")
+            rate  = (tts_opts or {}).get("rate", "-8%")
+            pitch = (tts_opts or {}).get("pitch", "-6Hz")
+            return await _tts_edge(text, voice=voice, rate=rate, pitch=pitch)
     except Exception as e:
-        logger.error(f"Text-to-speech error: {str(e)}")
+        logger.error(f"TTS error: {e}")
         return None
+
+# async def text_to_speech(text: str):
+#     try:
+#         tts = gTTS(text=text, lang="en")
+#         mp3_fp = io.BytesIO()
+#         tts.write_to_fp(mp3_fp)
+#         mp3_fp.seek(0)
+#         audio_data = base64.b64encode(mp3_fp.read()).decode("utf-8")
+#         logger.info("Audio generated successfully")
+#         return audio_data
+#     except Exception as e:
+#         logger.error(f"Text-to-speech error: {str(e)}")
+#         return None
 
 def process_frame(frame_data: str):
     try:
