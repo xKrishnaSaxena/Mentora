@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import React, { Children, isValidElement } from "react";
 import {
   Send,
   Mic,
@@ -56,27 +57,94 @@ function highlight(code, lang) {
 }
 
 /* Mermaid renderer for ```mermaid blocks inside details */
+function escapeHtml(s) {
+  return s.replace(
+    /[&<>"']/g,
+    (m) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[
+        m
+      ])
+  );
+}
+
+function sanitizeMermaid(code) {
+  let c = code || "";
+
+  // strip accidental inner ``` fences
+  c = c.replace(/^\s*```+mermaid\s*/i, "").replace(/```+\s*$/i, "");
+
+  // normalize quotes/dashes/arrows and whitespace
+  c = c
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/[–—]/g, "-")
+    .replace(/\u2192/g, "-->") // →
+    .replace(/\u2190/g, "<--") // ←
+    .replace(/-{1,2}>/g, "-->") // -> or --> -> -->
+    .replace(/<-{1,2}/g, "<--") // <- or <-- -> <--
+    .replace(/\t/g, "  ");
+
+  // ensure header present
+  const lines = c.split("\n");
+  const firstNonEmpty = (lines.find((l) => l.trim().length) || "").trim();
+  const hasHeader =
+    /^(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|journey)\b/.test(
+      firstNonEmpty
+    );
+  if (!hasHeader) c = "flowchart TD\n" + c;
+
+  return c.trim();
+}
+
+function looksLikeMermaid(code) {
+  const first = (code.split("\n").find((l) => l.trim()) || "").trim();
+  return /^(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|journey)\b/.test(
+    first
+  );
+}
+
 function Mermaid({ code }) {
   const containerRef = useRef(null);
 
   useEffect(() => {
     let cancelled = false;
+
     mermaid.initialize({
       startOnLoad: false,
+      // keep "loose" if you embed HTML/links; use "strict" if you want max safety
       securityLevel: "loose",
       theme: "dark",
+      deterministicIds: true,
     });
 
     (async () => {
       try {
+        const cleaned = sanitizeMermaid(code);
+        if (!looksLikeMermaid(cleaned))
+          throw new Error("Not a Mermaid diagram");
+
+        // Validate first. If invalid, try a last-resort header prepend.
+        try {
+          await mermaid.parse(cleaned);
+        } catch (e) {
+          const patched = /^flowchart\b/.test(cleaned)
+            ? cleaned
+            : "flowchart TD\n" + cleaned;
+          await mermaid.parse(patched);
+        }
+
         const id = "mmd-" + Math.random().toString(36).slice(2);
-        const { svg } = await mermaid.render(id, code);
+        const { svg } = await mermaid.render(id, cleaned);
         if (!cancelled && containerRef.current) {
           containerRef.current.innerHTML = svg;
         }
       } catch (e) {
-        if (containerRef.current)
-          containerRef.current.innerHTML = `<pre>Mermaid error: ${e.message}</pre>`;
+        // Graceful fallback: show raw code, never throw
+        if (!cancelled && containerRef.current) {
+          containerRef.current.innerHTML = `<pre class="rounded-lg overflow-x-auto bg-[#0c0f17] border border-white/10 p-3"><code>${escapeHtml(
+            code || ""
+          )}</code></pre>`;
+        }
       }
     })();
 
@@ -88,34 +156,62 @@ function Mermaid({ code }) {
 
   return <div ref={containerRef} className="max-w-full overflow-x-auto" />;
 }
+function CodeBlock({ raw, lang }) {
+  const html = React.useMemo(() => highlight(raw, lang), [raw, lang]);
+  return (
+    <pre className="rounded-lg overflow-x-auto bg-[#0c0f17] border border-white/10 p-3">
+      <code dangerouslySetInnerHTML={{ __html: html }} />
+    </pre>
+  );
+}
 
 /* Markdown renderer used in Details */
 function DetailsMarkdown({ content }) {
   return (
     <div className="prose prose-invert max-w-none prose-pre:my-0">
       <ReactMarkdown
+        // 1) Block code lives here
         components={{
+          pre({ children }) {
+            const arr = Children.toArray(children);
+            const only = arr.length === 1 ? arr[0] : null;
+            const isEl = isValidElement(only);
+            const className = isEl ? only.props?.className || "" : "";
+            const raw = String(
+              isEl ? only.props?.children || "" : children || ""
+            );
+            const match = /language-(\w+)/.exec(className);
+            const lang = match?.[1] || "plaintext";
+
+            if (lang === "mermaid") {
+              const cleaned = sanitizeMermaid(raw);
+              if (!looksLikeMermaid(cleaned))
+                return <CodeBlock raw={raw} lang="plaintext" />;
+              return <Mermaid code={cleaned} />;
+            }
+            return <CodeBlock raw={raw} lang={lang} />;
+          },
+
+          // 2) Inline code stays inline only
           code({ inline, className, children, ...props }) {
-            const match = /language-(\w+)/.exec(className || "");
-            const raw = String(children).replace(/\n$/, "");
-            if (!inline && match && match[1] === "mermaid") {
-              return <Mermaid code={raw} />;
-            }
-            if (!inline) {
-              const lang = match?.[1] || "plaintext";
-              return (
-                <pre className="rounded-lg overflow-x-auto bg-[#0c0f17] border border-white/10 p-3">
-                  <code
-                    dangerouslySetInnerHTML={{ __html: highlight(raw, lang) }}
-                  />
-                </pre>
-              );
-            }
+            // IMPORTANT: never return <pre> here
             return (
               <code className="bg-white/10 px-1.5 py-0.5 rounded" {...props}>
                 {children}
               </code>
             );
+          },
+
+          // 3) (Optional hardening) If a paragraph ends up with a lone <pre>, unwrap it
+          p({ children, ...props }) {
+            const arr = Children.toArray(children);
+            if (arr.length === 1) {
+              const child = arr[0];
+              if (isValidElement(child) && child.type === "pre") {
+                return child; // unwrap lone <pre> inside a <p>
+              }
+            }
+            return <p {...props}>{children}</p>;
           },
         }}
       >
@@ -693,8 +789,7 @@ export default function ChatInterface({
                     }
                   }}
                   rows={1}
-                  style={{ minHeight: 42, maxHeight: 120 }}
-                  className="flex-1 resize-none bg-transparent text-sm text-slate-100 placeholder:text-slate-400 outline-none px-2 py-1.5"
+                  className="flex-1 h-11 overflow-y-auto resize-none bg-transparent text-sm text-slate-100 placeholder:text-slate-400 outline-none px-2 py-1.5"
                 />
                 <div className="flex items-center gap-1">
                   {/* mic toggle always available */}

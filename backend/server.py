@@ -104,6 +104,31 @@ def clean_text(text: str) -> str:
     text = re.sub(r"!\[.*?\]\(.*?\)", "", text)
     text = re.sub(r"`(.*?)`", r"\1", text)
     return text.strip()
+MERMAID_FENCE_RE = re.compile(r"```mermaid\s+([\s\S]*?)```", re.IGNORECASE)
+
+def sanitize_mermaid_blocks(md: str) -> str:
+    def fix(block: str) -> str:
+        b = block or ""
+        # strip nested fences and normalize arrows/quotes/dashes
+        b = re.sub(r"```+", "", b)
+        b = (b.replace("→", "-->")
+               .replace("←", "<--")
+               .replace("—", "-")
+               .replace("–", "-")
+               .replace("“", '"')
+               .replace("”", '"')
+               .replace("’", "'")
+               .replace("‘", "'"))
+        # ensure header
+        first_line = next((ln.strip() for ln in b.splitlines() if ln.strip()), "")
+        if not re.match(r"^(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|journey)\b", first_line):
+            b = "flowchart TD\n" + b
+        return f"```mermaid\n{b.strip()}\n```"
+
+    try:
+        return MERMAID_FENCE_RE.sub(lambda m: fix(m.group(1)), md or "")
+    except Exception:
+        return md
 
 async def _tts_edge(text, voice="en-US-GuyNeural", rate="-10%", pitch="-8Hz"):
     communicate = edge_tts.Communicate(text, voice=voice, rate=rate, pitch=pitch)
@@ -206,11 +231,11 @@ Remember: patient, thorough, encouraging.
     response = model.generate_content(prompt)
     response_text = response.text or ""
     response_text_md = response_text
-
+    detailed = sanitize_mermaid_blocks(response_text_md)
     return {
         "question": question,
         "text": clean_text(response_text_md),
-        "detailed": response_text_md,
+        "detailed": detailed,
         "responseType": "rag",
         "mode": "rag",
         "context": context,
@@ -254,6 +279,7 @@ Return only the JSON object.
         response_json = json.loads(response_text)
         concise = response_json["concise"]
         detailed = response_json["detailed"]
+        detailed = sanitize_mermaid_blocks(detailed)
     except json.JSONDecodeError:
         start = response_text.find("{")
         end = response_text.rfind("}") + 1
@@ -262,6 +288,7 @@ Return only the JSON object.
                 response_json = json.loads(response_text[start:end])
                 concise = response_json["concise"]
                 detailed = response_json["detailed"]
+                detailed = sanitize_mermaid_blocks(detailed)
             except json.JSONDecodeError:
                 logger.error("Failed to parse extracted JSON")
                 concise = clean_text(response_text)
@@ -313,6 +340,7 @@ Question: {data['question']}"""
         response_json = json.loads(response_text)
         concise = response_json.get("concise", clean_text(response_text))
         detailed = response_json.get("detailed", response_text)
+        detailed = sanitize_mermaid_blocks(detailed)
     except json.JSONDecodeError:
         start = response_text.find("{")
         end = response_text.rfind("}") + 1
@@ -321,6 +349,7 @@ Question: {data['question']}"""
                 response_json = json.loads(response_text[start:end])
                 concise = response_json.get("concise", clean_text(response_text))
                 detailed = response_json.get("detailed", response_text[start:end])
+                detailed = sanitize_mermaid_blocks(detailed)
             except json.JSONDecodeError:
                 logger.error("Failed to parse extracted JSON")
                 concise = clean_text(response_text)
