@@ -130,6 +130,7 @@ function DetailsMarkdown({ content }) {
 export default function ChatInterface({
   category,
   categoryIcon,
+  chatId,
   categoryColor = "indigo",
   onBackClick,
   initialQuestion = "",
@@ -302,6 +303,43 @@ export default function ChatInterface({
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+  useEffect(() => {
+    if (!chatId) return;
+
+    // local first
+    const cached = localStorage.getItem(`chat:${chatId}`);
+    if (cached) {
+      try {
+        setMessages(JSON.parse(cached));
+      } catch {}
+    } else {
+      setMessages([]);
+    }
+
+    // canonical server history
+    const token = localStorage.getItem("authToken");
+    fetch(`${API_BASE}/chats/${chatId}/messages`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => (r.ok ? r.json() : []))
+      .then((data) =>
+        setMessages(
+          data.map((m) => ({
+            type: m.role === "assistant" ? "assistant" : "user",
+            text: m.text || "",
+            detailed: m.detailed || "",
+            mode: m.mode || "teach",
+          }))
+        )
+      )
+      .catch(() => {});
+  }, [chatId]);
+
+  // Persist
+  useEffect(() => {
+    if (!chatId) return;
+    localStorage.setItem(`chat:${chatId}`, JSON.stringify(messages));
+  }, [messages, chatId]);
 
   /* ASR */
   const startRecognition = () => {
@@ -457,8 +495,9 @@ export default function ChatInterface({
       ws.current.send(
         JSON.stringify({
           type: isVoice ? "voice_query" : "text_query",
-          question, // ✅ FIX: send the actual text, not inputText
-          frame: framePayload, // ✅ only for learn
+          chatId,
+          question,
+          frame: framePayload,
           mode: selectedMode,
           category,
           history,
@@ -497,7 +536,7 @@ export default function ChatInterface({
   };
 
   return (
-    <div className="flex h-[calc(100vh-140px)] w-full flex-col rounded-2xl bg-[#0b0f19] text-slate-100 border border-white/5 shadow-[0_10px_30px_-12px_rgba(0,0,0,0.35)] overflow-hidden">
+    <div className="flex h-full w-full min-h-0 flex-col rounded-2xl bg-[#0b0f19] text-slate-100 border border-white/5 shadow-[0_10px_30px_-12px_rgba(0,0,0,0.35)] overflow-hidden">
       {/* hidden audio element for reliable playback */}
       <audio ref={audioElRef} hidden />
 
@@ -555,9 +594,9 @@ export default function ChatInterface({
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-3 sm:px-4 py-3 space-y-3">
+      <div className="flex-1 min-h-0 overflow-y-auto px-3 sm:px-4 py-3 space-y-3">
         {!messages.length && (
-          <div className="mx-auto max-w-2xl rounded-xl border border-white/10 bg-white/5 p-4 text-center text-sm text-slate-300">
+          <div className="rounded-xl border border-white/10 bg-white/5 p-4 text-center text-sm text-slate-300">
             Ask about {category}. Pick a mode, type your question, or use the
             mic.
           </div>
@@ -639,7 +678,7 @@ export default function ChatInterface({
 
       {/* Composer */}
       <div className="border-t border-white/10 bg-[#0b0f19]/80 backdrop-blur px-3 sm:px-4 py-3">
-        <div className="mx-auto w-full sm:max-w-3xl">
+        <div className="w-full">
           <div className="flex items-end gap-2">
             <div className="flex-1">
               <div className="flex items-center rounded-2xl border border-white/10 bg-white/5 px-2 py-1.5 shadow-inner">

@@ -6,6 +6,7 @@ import ChatInterface from "./components/ChatInterface";
 import Notes from "./components/Notes";
 import { LogOut, Sparkles } from "lucide-react";
 import CategorySelect from "./components/CategorySelect";
+import ChatSidebar from "./components/ChatSidebar";
 
 function Shell() {
   const { token, user, logout } = useAuth();
@@ -92,15 +93,14 @@ function Shell() {
 
       <main className="flex-1 px-3 md:px-6 py-4">
         {screen === "home" && (
-          <div className="rounded-2xl border border-white/10 bg-[#0b0f19] shadow-[0_10px_30px_-12px_rgba(0,0,0,0.35)] p-2 sm:p-3">
-            <ChatInterface
-              key={token || "guest"} // <— force remount on new token
+          <div className="rounded-2xl border border-white/10 bg-[#0b0f19] shadow-[0_10px_30px_-12px_rgba(0,0,0,0.35)] p-0 overflow-hidden">
+            {/* App shell layout */}
+            <HomeWithSidebar
+              token={token}
               category={category}
               categoryIcon={categoryIcon}
-              onBackClick={() => {}}
               addNote={addNote}
               onNavigate={setScreen}
-              initialQuestion=""
             />
           </div>
         )}
@@ -115,6 +115,51 @@ function Shell() {
       <footer className="py-6 text-center text-xs text-slate-400 border-t border-white/10">
         © {new Date().getFullYear()} Mentora
       </footer>
+    </div>
+  );
+}
+function HomeWithSidebar({
+  token,
+  category,
+  categoryIcon,
+  addNote,
+  onNavigate,
+}) {
+  const [activeChatId, setActiveChatId] = useState(
+    () => localStorage.getItem("activeChatId") || null
+  );
+
+  const selectChat = (id) => {
+    setActiveChatId(id);
+    if (id) localStorage.setItem("activeChatId", id);
+    else localStorage.removeItem("activeChatId");
+  };
+
+  return (
+    <div className="flex h-[calc(100vh-180px)] min-h-[560px]">
+      <ChatSidebar
+        token={token}
+        activeChatId={activeChatId}
+        onSelectChat={selectChat}
+      />
+      <div className="flex-1 min-w-0 p-2 sm:p-3">
+        {!activeChatId ? (
+          <div className="h-full grid place-items-center text-slate-400 text-sm">
+            No chat selected — create a new chat from the left.
+          </div>
+        ) : (
+          <ChatInterface
+            key={activeChatId}
+            chatId={activeChatId}
+            category={category}
+            categoryIcon={categoryIcon}
+            onBackClick={() => {}}
+            addNote={addNote}
+            onNavigate={onNavigate}
+            initialQuestion=""
+          />
+        )}
+      </div>
     </div>
   );
 }

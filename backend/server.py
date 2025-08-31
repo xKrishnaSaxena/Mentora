@@ -21,7 +21,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Milvus
-
+from bson import ObjectId
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -168,13 +168,16 @@ async def handle_rag_mode(data):
 
     question = data["question"]
     history = data.get("history", [])
+    memory = data.get("memory", "")
+    memory_text = f"\n### Conversation Memory:\n{memory}\n" if memory else ""
     conversation_context = "\n".join([f'{msg["role"]}: {msg["content"]}' for msg in history[-3:]])
-
+    
     docs = vector_store.similarity_search(question, k=3)
     context = "\n\n".join([doc.page_content for doc in docs])
 
     prompt = f"""
 You are an expert AI tutor helping students understand concepts from their textbook. 
+{memory_text}
 The student has asked: "{question}"
 
 ### Textbook Context:
@@ -190,6 +193,13 @@ The student has asked: "{question}"
 4. For processes or systems, include a Mermaid diagram using ```mermaid code blocks.
 5. Format with Markdown (headings, bullets, bold key terms).
 6. If the context doesn't contain the answer, say: "This topic isn't covered in our textbook, but here's what I know..."
+
+When you include Mermaid:
+- Use ASCII only. No unicode arrows or dashes.
+- Start with a header: "flowchart TD" (or "sequenceDiagram" if appropriate).
+- Flowchart edges MUST use "-->" and "<--" only (never "->" or "→").
+- Node ids: simple alphanumerics (A, B1, step2). Put all text inside [brackets] or (round) as labels.
+- No backticks inside the code block; fence exactly with ```mermaid ... ```
 
 Remember: patient, thorough, encouraging.
 """
@@ -210,8 +220,10 @@ async def handle_teach_mode(data):
     category = data.get("category", "")
     question = data["question"]
     history = data.get("history", [])
+    memory = data.get("memory", "")
+    memory_text = f"\n### Conversation Memory:\n{memory}\n" if memory else ""
     prompt = f"""You are an expert tutor on {category}. Explain step-by-step and check for understanding.
-
+{memory_text}
 Here is the conversation history:
 """
     for msg in history:
@@ -222,6 +234,13 @@ Provide the next response.
 
 If the user is asking a new question, start in small parts and ask if they understand after each part.
 If they say 'yes', proceed; if 'no', go deeper and include a ```mermaid diagram when helpful.
+
+When you include Mermaid:
+- Use ASCII only. No unicode arrows or dashes.
+- Start with a header: "flowchart TD" (or "sequenceDiagram" if appropriate).
+- Flowchart edges MUST use "-->" and "<--" only (never "->" or "→").
+- Node ids: simple alphanumerics (A, B1, step2). Put all text inside [brackets] or (round) as labels.
+- No backticks inside the code block; fence exactly with ```mermaid ... ```
 
 Respond in JSON with:
 - "concise": short (<= 2 sentences, plain text)
@@ -264,11 +283,21 @@ async def handle_learn_mode(data):
     include_code = "code" in data.get("question", "").lower()
     # Allow learn mode without a frame (fallback to text-only)
     frame_b64 = data.get("frame")
+    memory = data.get("memory", "")
+    memory_text = f"\n### Conversation Memory:\n{memory}\n" if memory else ""
     if frame_b64:
         frame = process_frame(frame_b64)
-        prompt = f"""Analyze the provided image and answer this question in JSON with:
+        prompt = f"""{memory_text}
+        Analyze the provided image and answer this question in JSON with:
 - "concise": short (<= 2 sentences, plain text).
 - "detailed": Markdown{' with a code snippet only if requested' if not include_code else ''}, and end with a ```mermaid diagram.
+
+When you include Mermaid:
+- Use ASCII only. No unicode arrows or dashes.
+- Start with a header: "flowchart TD" (or "sequenceDiagram" if appropriate).
+- Flowchart edges MUST use "-->" and "<--" only (never "->" or "→").
+- Node ids: simple alphanumerics (A, B1, step2). Put all text inside [brackets] or (round) as labels.
+- No backticks inside the code block; fence exactly with ```mermaid ... ```
 
 Question: {data['question']}
 Return only the JSON object, without extra text or backticks."""
@@ -343,7 +372,102 @@ async def handle_quiz_mode(data):
         "mode": "quiz",
     }
 
+@web.middleware
+async def auth_mw(request, handler):
+    # Let CORS preflight go through so aiohttp_cors can inject headers
+    if request.method == "OPTIONS":
+        return await handler(request)
+
+    # public routes
+    if request.path in ("/health", "/", "/login", "/register", "/ws"):
+        return await handler(request)
+
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return web.Response(status=401, text="Missing token")
+
+    token = auth.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        request["user_id"] = payload["user_id"]
+    except jwt.InvalidTokenError:
+        return web.Response(status=401, text="Invalid token")
+
+    return await handler(request)
+
+
 # --------- HTTP handlers ---------
+async def create_chat(request):
+    user_id = request["user_id"]
+    data = await request.json()
+    title = (data.get("title") or "New chat").strip()
+    category = data.get("category") or ""
+    mode = data.get("mode") or "teach"
+    doc = {
+        "userId": ObjectId(user_id),
+        "title": title,
+        "category": category,
+        "mode": mode,
+        "memory": "",
+        "createdAt": datetime.now(timezone.utc),
+        "updatedAt": datetime.now(timezone.utc),
+    }
+    res = await request.app["db"].chats.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    return web.json_response({"id": str(doc["_id"]), "title": title})
+
+async def list_chats(request):
+    user_id = request["user_id"]
+    cur = request.app["db"].chats.find(
+        {"userId": ObjectId(user_id)},
+        {"title": 1, "updatedAt": 1}
+    ).sort("updatedAt", -1)
+    items = [{"id": str(x["_id"]), "title": x["title"], "updatedAt": x["updatedAt"].isoformat()} async for x in cur]
+    return web.json_response(items)
+
+async def rename_chat(request):
+    user_id = request["user_id"]
+    chat_id = request.match_info["chat_id"]
+    data = await request.json()
+    title = (data.get("title") or "").strip()
+    if not title:
+        return web.Response(status=400, text="Missing title")
+    res = await request.app["db"].chats.update_one(
+        {"_id": ObjectId(chat_id), "userId": ObjectId(user_id)},
+        {"$set": {"title": title, "updatedAt": datetime.now(timezone.utc)}}
+    )
+    if not res.matched_count:
+        return web.Response(status=404, text="Not found")
+    return web.json_response({"ok": True})
+
+async def delete_chat(request):
+    user_id = request["user_id"]
+    chat_id = request.match_info["chat_id"]
+    db = request.app["db"]
+    q = {"_id": ObjectId(chat_id), "userId": ObjectId(user_id)}
+    if not await db.chats.find_one(q):
+        return web.Response(status=404, text="Not found")
+    await db.messages.delete_many({"chatId": ObjectId(chat_id), "userId": ObjectId(user_id)})
+    await db.chats.delete_one(q)
+    return web.json_response({"ok": True})
+
+async def get_messages(request):
+    user_id = request["user_id"]
+    chat_id = request.match_info["chat_id"]
+    limit = int(request.query.get("limit", "200"))
+    cur = request.app["db"].messages.find(
+        {"chatId": ObjectId(chat_id), "userId": ObjectId(user_id)}
+    ).sort("createdAt", 1).limit(limit)
+    msgs = [{
+        "role": x["role"],
+        "text": x["content"],
+        "detailed": x.get("detailed") or "",
+        "mode": x.get("mode") or "teach",
+        "createdAt": x["createdAt"].isoformat(),
+    } async for x in cur]
+    return web.json_response(msgs)
+
+
 
 async def register_handler(request):
     data = await request.json()
@@ -403,46 +527,115 @@ async def websocket_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     ws.user_id = user_id
+    db = request.app["db"]
 
-    try:
-        async for msg in ws:
-            if msg.type == WSMsgType.TEXT:
-                try:
-                    data = json.loads(msg.data)
-                    logger.info(f"Received message: {data}")
-                    mode = data.get("mode")
-                    if mode == "learn":
-                        response_data = await handle_learn_mode(data)
-                    elif mode == "teach":
-                        response_data = await handle_teach_mode(data)
-                    elif mode == "quiz":
-                        response_data = await handle_quiz_mode(data)
-                    elif mode == "rag":
-                        response_data = await handle_rag_mode(data)
-                    else:
-                        response_data = {"error": "Invalid mode"}
+    async for msg in ws:
+        if msg.type != WSMsgType.TEXT:
+            continue
 
-                    if data.get("type") == "voice_query" and not response_data.get("error"):
-                        audio_base64 = await text_to_speech(response_data["text"])
-                        if audio_base64:
-                            response_data["audio"] = audio_base64
-                            logger.info("Audio generated for voice response")
-                        else:
-                            response_data["error"] = "Failed to generate audio"
-                            logger.error("Audio generation failed")
+        data = json.loads(msg.data)
+        chat_id = data.get("chatId")
+        if not chat_id:
+            await ws.send_json({"error": "Missing chatId"})
+            continue
 
-                    await ws.send_json(response_data)
-                except json.JSONDecodeError as e:
-                    logger.error(f"Invalid JSON received: {e}")
-                    await ws.send_json({"error": "Invalid JSON"})
-                except Exception as e:
-                    logger.error(f"Error processing message: {e}")
-                    await ws.send_json({"error": str(e)})
-    except Exception as e:
-        logger.error(f"Unexpected error in WebSocket handler: {e}")
-    finally:
-        logger.info("Closing WebSocket connection")
-        await ws.close()
+        chat = await db.chats.find_one({"_id": ObjectId(chat_id), "userId": ObjectId(user_id)})
+        if not chat:
+            await ws.send_json({"error": "Chat not found"})
+            continue
+
+        mode = data.get("mode", "teach")
+        question = (data.get("question") or "").strip()
+        if not question:
+            await ws.send_json({"error": "Empty question"})
+            continue
+
+        
+        await db.messages.insert_one({
+            "chatId": ObjectId(chat_id),
+            "userId": ObjectId(user_id),
+            "role": "user",
+            "content": question,
+            "detailed": "",
+            "mode": mode,
+            "createdAt": datetime.now(timezone.utc),
+        })
+
+        
+        cur = db.messages.find({"chatId": ObjectId(chat_id), "userId": ObjectId(user_id)}).sort("createdAt", 1)
+        history_docs = [x async for x in cur][-30:]   
+        memory = chat.get("memory", "")
+
+        
+        history = [{"role": d["role"], "content": d["content"] or d.get("detailed","")} for d in history_docs]
+
+        
+        payload = {
+            "question": question,
+            "history": history,
+            "mode": mode,
+            "category": data.get("category", ""),
+            "frame": data.get("frame"),
+            "memory": memory,
+        }
+
+        if mode == "learn":
+            response_data = await handle_learn_mode(payload)
+        elif mode == "teach":
+            response_data = await handle_teach_mode(payload)
+        elif mode == "quiz":
+            response_data = await handle_quiz_mode(payload)
+        elif mode == "rag":
+            response_data = await handle_rag_mode(payload)
+        else:
+            response_data = {"error": "Invalid mode"}
+
+        # 4) store assistant message
+        if not response_data.get("error"):
+            await db.messages.insert_one({
+                "chatId": ObjectId(chat_id),
+                "userId": ObjectId(user_id),
+                "role": "assistant",
+                "content": response_data.get("text",""),
+                "detailed": response_data.get("detailed",""),
+                "mode": response_data.get("mode", mode),
+                "createdAt": datetime.now(timezone.utc),
+            })
+            await db.chats.update_one(
+                {"_id": ObjectId(chat_id)},
+                {"$set": {"updatedAt": datetime.now(timezone.utc)}}
+            )
+
+        # 5) optional: lightweight memory update every 8 user turns
+        turns = sum(1 for d in history_docs if d["role"] == "user")
+        if turns % 8 == 0:
+            try:
+                mem_prompt = f"""Summarize the stable facts, user preferences, goals, and constraints from this chat.
+Return 5-10 bullet points, concise. Avoid transient details.
+History:
+{json.dumps(history[-40:], ensure_ascii=False, indent=2)}
+"""
+                mem_resp = model.generate_content(mem_prompt)
+                new_mem = (mem_resp.text or "").strip()
+                if new_mem:
+                    await db.chats.update_one(
+                        {"_id": ObjectId(chat_id)},
+                        {"$set": {"memory": new_mem}}
+                    )
+            except Exception as _:
+                pass
+
+        # 6) TTS (unchanged)
+        if data.get("type") == "voice_query" and not response_data.get("error"):
+            audio_base64 = await text_to_speech(response_data["text"])
+            if audio_base64:
+                response_data["audio"] = audio_base64
+            else:
+                response_data["error"] = "Failed to generate audio"
+
+        await ws.send_json(response_data)
+
+    await ws.close()
     return ws
 
 async def health_check(request):
@@ -455,7 +648,7 @@ async def start_server():
     asyncio.create_task(initialize_pdf_rag())
     client = AsyncIOMotorClient(MONGODB_URI)
     db = client["mydatabase"]
-    app = web.Application()
+    app = web.Application(middlewares=[auth_mw])
     app["db"] = db
 
     cors = aiohttp_cors.setup(app)
@@ -465,23 +658,27 @@ async def start_server():
         {"path": "/register", "handler": register_handler, "method": "POST", "allow_methods": ["POST"]},
         {"path": "/login", "handler": login_handler, "method": "POST", "allow_methods": ["POST"]},
         {"path": "/ws", "handler": websocket_handler, "method": "GET", "allow_methods": ["GET"]},
+        {"path": "/chats", "handler": create_chat, "method": "POST", "allow_methods": ["POST"]},
+        {"path": "/chats", "handler": list_chats, "method": "GET", "allow_methods": ["GET"]},
+        {"path": "/chats/{chat_id}", "handler": rename_chat, "method": "PATCH", "allow_methods": ["PATCH"]},
+        {"path": "/chats/{chat_id}", "handler": delete_chat, "method": "DELETE", "allow_methods": ["DELETE"]},
+        {"path": "/chats/{chat_id}/messages", "handler": get_messages, "method": "GET", "allow_methods": ["GET"]},
     ]
     for config in route_configs:
         if config["method"] == "GET":
             route = app.router.add_get(config["path"], config["handler"])
         elif config["method"] == "POST":
             route = app.router.add_post(config["path"], config["handler"])
-        cors.add(
-            route,
-            {
-                "*": aiohttp_cors.ResourceOptions(
-                    allow_credentials=True,
-                    expose_headers="*",
-                    allow_headers="*",
-                    allow_methods=config["allow_methods"],
-                )
-            },
-        )
+        elif config["method"] == "PATCH":
+            route = app.router.add_patch(config["path"], config["handler"])
+        elif config["method"] == "DELETE":
+            route = app.router.add_delete(config["path"], config["handler"])
+        cors.add(route, {"*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*",
+            allow_methods=config["allow_methods"],
+        )})
 
     runner = web.AppRunner(app)
     await runner.setup()
