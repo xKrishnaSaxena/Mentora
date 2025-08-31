@@ -17,3 +17,4 @@ langchain_google_genai
 langchain
 pypdf
 pymilvus
+aiohttp_cors
