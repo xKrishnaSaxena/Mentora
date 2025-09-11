@@ -12,7 +12,7 @@ import {
   Bot,
   User,
 } from "lucide-react";
-
+import QuizCard from "./QuizCard";
 import ReactMarkdown from "react-markdown";
 import mermaid from "mermaid";
 import Prism from "prismjs";
@@ -237,6 +237,7 @@ export default function ChatInterface({
   const [inputText, setInputText] = useState(initialQuestion);
   const [selectedMode, setSelectedMode] = useState("teach");
   const [showModeMenu, setShowModeMenu] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
 
   const [connectionError, setConnectionError] = useState(null);
 
@@ -293,6 +294,7 @@ export default function ChatInterface({
             setTimeout(() => onNavigate?.("login"), 800);
             return;
           }
+          setIsGenerating(false);
 
           // push assistant message
           setMessages((prev) => [
@@ -303,6 +305,7 @@ export default function ChatInterface({
               detailed: data.detailed ?? "",
               responseType: data.responseType ?? "answer",
               mode: data.mode ?? selectedMode,
+              quiz: data.quiz ?? null,
             },
           ]);
 
@@ -352,7 +355,9 @@ export default function ChatInterface({
       };
 
       ws.current.onerror = () => {
+        setIsGenerating(false);
         setConnectionError("Connection problem. Reconnecting…");
+
         if (
           ![WebSocket.CLOSED, WebSocket.CLOSING].includes(
             ws.current?.readyState
@@ -364,6 +369,7 @@ export default function ChatInterface({
 
       ws.current.onclose = (e) => {
         if (e.code === 1008 && String(e.reason).includes("Invalid token")) {
+          setIsGenerating(false);
           setConnectionError("Session expired. Please log in again.");
           localStorage.removeItem("authToken");
           setTimeout(() => onNavigate?.("login"), 800);
@@ -575,7 +581,7 @@ export default function ChatInterface({
       ...prev,
       { type: "user", text: question, mode: isVoice ? "voice" : "text" },
     ]);
-
+    setIsGenerating(true);
     // build compact history
     const history = [...messages, { type: "user", text: question }].map(
       (m) => ({
@@ -630,7 +636,11 @@ export default function ChatInterface({
     });
     onNavigate?.("notes");
   };
-
+  function SpinnerDot() {
+    return (
+      <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-white/25 border-t-white/70" />
+    );
+  }
   return (
     <div className="flex h-full w-full min-h-0 flex-col rounded-2xl bg-[#0b0f19] text-slate-100 border border-white/5 shadow-[0_10px_30px_-12px_rgba(0,0,0,0.35)] overflow-hidden">
       {/* hidden audio element for reliable playback */}
@@ -732,6 +742,12 @@ export default function ChatInterface({
                 </p>
               )}
 
+              {m.responseType === "quiz" && m.quiz && Array.isArray(m.quiz) && (
+                <div className="mt-2 rounded-lg border border-white/10 p-3 bg-black/20">
+                  <QuizCard quiz={m.quiz} />
+                </div>
+              )}
+
               {m.detailed && (
                 <details className="mt-2 group">
                   <summary className="text-xs cursor-pointer select-none opacity-80 hover:opacity-100">
@@ -768,7 +784,19 @@ export default function ChatInterface({
             </div>
           </div>
         ))}
-
+        {isGenerating && (
+          <div className="w-full flex justify-start">
+            <div className="max-w-[82%] sm:max-w-[68%] rounded-2xl border bg-white/[0.04] border-white/10 text-slate-100 p-3 shadow">
+              <div className="flex items-center gap-2 mb-1 opacity-70 text-xs">
+                <Bot size={14} />
+                <span>Assistant</span>
+              </div>
+              <div className="text-sm flex items-center gap-2 opacity-80">
+                <SpinnerDot /> <span>Thinking…</span>
+              </div>
+            </div>
+          </div>
+        )}
         <div ref={messagesEndRef} />
       </div>
 

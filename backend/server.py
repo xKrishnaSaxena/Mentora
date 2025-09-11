@@ -20,7 +20,7 @@ import aiohttp_cors
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Milvus
+from langchain_community.vectorstores import Milvus,FAISS
 from bson import ObjectId
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -63,6 +63,7 @@ async def initialize_pdf_rag():
     global pdf_initialized, vector_store
     if pdf_initialized:
         return
+
     collection_name = "foxlearner_ch6_embeddings"
     try:
         current_dir = os.path.dirname(__file__)
@@ -71,29 +72,43 @@ async def initialize_pdf_rag():
             raise FileNotFoundError(f"❌ PDF file not found at: {pdf_path}")
 
         docs = load_pdf_documents(pdf_path)
+        if not docs:
+            raise ValueError("❌ PDF loader returned no documents")
+
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         split_docs = text_splitter.split_documents(docs)
+        if not split_docs:
+            raise ValueError("❌ Text splitter produced no chunks")
 
         embeddings = GoogleGenerativeAIEmbeddings(
             model="models/text-embedding-004",
             google_api_key=GEMINI_API_KEY,
         )
 
-        vector_store = Milvus.from_documents(
-            documents=split_docs,
-            collection_name=collection_name,
-            embedding=embeddings,
-            connection_args={
-                "uri": ZILLIZ_CLOUD_URI,
-                "token": ZILLIZ_CLOUD_TOKEN,
-                "secure": True,
-            },
-        )
+        # Try Milvus/Zilliz first
+        try:
+            vector_store = Milvus.from_documents(
+                documents=split_docs,
+                collection_name=collection_name,
+                embedding=embeddings,
+                connection_args={
+                    "uri": ZILLIZ_CLOUD_URI,
+                    "token": ZILLIZ_CLOUD_TOKEN,
+                    "secure": True,
+                },
+            )
+            logger.info("✅ RAG: Milvus/Zilliz collection ready: %s", collection_name)
+        except Exception as milvus_err:
+            # Fallback to in-memory FAISS so RAG still works locally
+            logger.error("Milvus init failed (%s). Falling back to FAISS (in-memory).", milvus_err)
+            vector_store = FAISS.from_documents(split_docs, embeddings)
+            logger.info("✅ RAG: FAISS (in-memory) index initialized")
+
         pdf_initialized = True
-        logger.info("PDF RAG initialized successfully")
-        print(f"✅ Embedding complete. Stored in Milvus collection: {collection_name}")
     except Exception as e:
         logger.error(f"PDF RAG initialization failed: {str(e)}")
+        pdf_initialized = False
+
 
 def clean_text(text: str) -> str:
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
@@ -185,23 +200,50 @@ async def ask_gemini_with_image(frame, question: str):
     except Exception as e:
         logger.error(f"Gemini API error: {str(e)}")
         return f"Error: {str(e)}"
+    
+FENCE_RE = re.compile(r"```[\s\S]*?```", re.MULTILINE)
+
+def strip_fenced_blocks(md: str) -> str:
+    return FENCE_RE.sub("", md or "")
+
+def to_concise_plain(text: str, max_sentences: int = 2) -> str:
+    """
+    Turn any markdown-ish text into a short plain summary:
+    - drop fenced code blocks
+    - strip markdown decorations
+    - keep up to N sentences
+    """
+    s = strip_fenced_blocks(text or "")
+    s = clean_text(s)  # your existing markdown cleaner (bold/italics/inline code etc.)
+    # collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    # limit sentences
+    parts = re.split(r"(?<=[.!?])\s+", s)
+    s2 = " ".join(parts[:max_sentences]).strip()
+    return s2 or s
 
 async def handle_rag_mode(data):
     await initialize_pdf_rag()
     if not vector_store:
-        return {"error": "RAG not initialized"}
+        return {
+            "error": "RAG not initialized",
+            "text": "RAG index could not be initialized. Check that lecs105.pdf exists and your Zilliz credentials are valid.",
+            "responseType": "rag",
+            "mode": "rag",
+        }
 
     question = data["question"]
     history = data.get("history", [])
     memory = data.get("memory", "")
     memory_text = f"\n### Conversation Memory:\n{memory}\n" if memory else ""
     conversation_context = "\n".join([f'{msg["role"]}: {msg["content"]}' for msg in history[-3:]])
-    
+
     docs = vector_store.similarity_search(question, k=3)
     context = "\n\n".join([doc.page_content for doc in docs])
 
+    # Ask for JSON so we can separate concise/detailed cleanly
     prompt = f"""
-You are an expert AI tutor helping students understand concepts from their textbook. 
+You are an expert AI tutor helping students understand concepts from their textbook.
 {memory_text}
 The student has asked: "{question}"
 
@@ -211,13 +253,8 @@ The student has asked: "{question}"
 ### Conversation History:
 {conversation_context}
 
-### Instructions:
-1. Provide a detailed, step-by-step explanation using information from the textbook context.
-2. If the concept spans multiple sections, synthesize information from different parts of the book.
-3. Use clear examples and analogies.
-4. For processes or systems, include a Mermaid diagram using ```mermaid code blocks.
-5. Format with Markdown (headings, bullets, bold key terms).
-6. If the context doesn't contain the answer, say: "This topic isn't covered in our textbook, but here's what I know..."
+If the user is asking a new question, start in small parts and ask if they understand after each part.
+If they say 'yes', proceed; if 'no', go deeper and include a ```mermaid diagram when helpful.
 
 When you include Mermaid:
 - Use ASCII only. No unicode arrows or dashes.
@@ -226,19 +263,43 @@ When you include Mermaid:
 - Node ids: simple alphanumerics (A, B1, step2). Put all text inside [brackets] or (round) as labels.
 - No backticks inside the code block; fence exactly with ```mermaid ... ```
 
-Remember: patient, thorough, encouraging.
+Respond in JSON with:
+- "concise": short (<= 2 sentences, plain text)
+- "detailed": Markdown explanation
+
+Return only the JSON object.
+
 """
     response = model.generate_content(prompt)
-    response_text = response.text or ""
-    response_text_md = response_text
-    detailed = sanitize_mermaid_blocks(response_text_md)
+    response_text = (response.text or "").strip()
+    try:
+        response_json = json.loads(response_text)
+        concise = response_json["concise"]
+        detailed = response_json["detailed"]
+        detailed = sanitize_mermaid_blocks(detailed)
+    except json.JSONDecodeError:
+        start = response_text.find("{")
+        end = response_text.rfind("}") + 1
+        if start != -1 and end != -1:
+            try:
+                response_json = json.loads(response_text[start:end])
+                concise = response_json["concise"]
+                detailed = response_json["detailed"]
+                detailed = sanitize_mermaid_blocks(detailed)
+            except json.JSONDecodeError:
+                logger.error("Failed to parse extracted JSON")
+                concise = clean_text(response_text)
+                detailed = "Error: Unable to generate detailed explanation."
+        else:
+            logger.error("No JSON object found in response")
+            concise = clean_text(response_text)
+            detailed = "Error: Unable to generate detailed explanation."
     return {
         "question": question,
-        "text": clean_text(response_text_md),
+        "text": concise,
         "detailed": detailed,
-        "responseType": "rag",
-        "mode": "rag",
-        "context": context,
+        "responseType": "answer",
+        "mode": "teach",
     }
 
 async def handle_teach_mode(data):
@@ -369,37 +430,85 @@ Question: {data['question']}"""
 
 async def handle_quiz_mode(data):
     topic = data["question"]
+
     prompt = (
-        f"Generate a 5-question MCQ quiz on: {topic}. Each question has 4 options A-D, indicate the correct letter and a brief explanation.\n"
-        f"Format for each question:\n"
-        f"Q: [question]\nA: [A]\nB: [B]\nC: [C]\nD: [D]\nCorrect: [A|B|C|D]\nExplanation: [text]"
+        "Create a 5-question multiple-choice quiz on the topic given below.\n"
+        "Return ONLY a JSON object with this exact shape:\n"
+        "{\n"
+        '  "questions": [\n'
+        '    {\n'
+        '      "question": "string",\n'
+        '      "options": ["A", "B", "C", "D"],\n'
+        '      "answer_index": 0,\n'
+        '      "explanation": "string"\n'
+        "    },\n"
+        "    ... (total 5)\n"
+        "  ]\n"
+        "}\n"
+        "No extra text.\n"
+        f"Topic: {topic}\n"
     )
-    response = model.generate_content(prompt)
-    quiz_text = clean_text(response.text or "")
-    quiz_markdown = f"### Quiz on {topic}\n\n"
-    for i, block in enumerate(quiz_text.split("\n\n"), 1):
-        lines = [line.strip() for line in block.split("\n") if line.strip()]
-        if (
-            len(lines) >= 7
-            and lines[0].startswith("Q:")
-            and lines[5].startswith("Correct:")
-            and lines[6].startswith("Explanation:")
-        ):
-            question = lines[0][2:].strip()
-            options = [line[2:].strip() for line in lines[1:5]]
-            correct = lines[5][8:].strip()
-            explanation = lines[6][12:].strip()
-            quiz_markdown += f"**Question {i}:** {question}\n\n"
-            for opt in options:
-                quiz_markdown += f"- {opt}\n"
-            quiz_markdown += f"\n**Correct Answer:** {correct}\n\n**Explanation:** {explanation}\n\n"
+
+    resp = model.generate_content(prompt)
+    raw = (resp.text or "").strip()
+
+    questions = []
+    try:
+        data_json = json.loads(raw)
+        questions = data_json.get("questions", [])
+        # light validation
+        questions = [
+            q for q in questions
+            if isinstance(q.get("question"), str)
+            and isinstance(q.get("options"), list) and len(q["options"]) == 4
+            and isinstance(q.get("answer_index"), int) and 0 <= q["answer_index"] < 4
+            and isinstance(q.get("explanation"), str)
+        ][:5]
+    except Exception:
+        # Fallback: reuse your old text parser if JSON fails
+        old_prompt = (
+            f"Generate a 5-question MCQ quiz on: {topic}. Each question has 4 options A-D, "
+            f"indicate the correct letter and a brief explanation.\n"
+            f"Format for each question:\n"
+            f"Q: [question]\nA: [A]\nB: [B]\nC: [C]\nD: [D]\nCorrect: [A|B|C|D]\nExplanation: [text]"
+        )
+        fallback = model.generate_content(old_prompt)
+        quiz_text = clean_text(fallback.text or "")
+        blocks = [b for b in quiz_text.split("\n\n") if b.strip()]
+        letter_to_idx = {"A":0,"B":1,"C":2,"D":3}
+        for block in blocks:
+            lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+            if len(lines) >= 7 and lines[0].startswith("Q:") and lines[5].startswith("Correct:"):
+                q = lines[0][2:].strip()
+                opts = [lines[1][2:].strip(), lines[2][2:].strip(), lines[3][2:].strip(), lines[4][2:].strip()]
+                correct_letter = lines[5][8:].strip()[:1]
+                exp = lines[6][12:].strip()
+                if correct_letter in letter_to_idx:
+                    questions.append({
+                        "question": q, "options": opts,
+                        "answer_index": letter_to_idx[correct_letter],
+                        "explanation": exp
+                    })
+        questions = questions[:5]
+
+    # Printable Markdown for the Details panel (optional)
+    quiz_md = [f"### Quiz on {topic}\n"]
+    for i, q in enumerate(questions, 1):
+        quiz_md.append(f"**Question {i}:** {q['question']}")
+        for opt in q["options"]:
+            quiz_md.append(f"- {opt}")
+        quiz_md.append(f"\n**Answer:** {chr(65+q['answer_index'])}\n\n**Why:** {q['explanation']}\n")
+    quiz_markdown = "\n".join(quiz_md)
+
     return {
         "question": data["question"],
-        "text": f"Here is your quiz on {topic}",
+        "text": f"Here’s a 5-question quiz on {topic}.",
         "detailed": quiz_markdown,
+        "quiz": questions,                 # <-- NEW: structured payload
         "responseType": "quiz",
         "mode": "quiz",
     }
+
 
 @web.middleware
 async def auth_mw(request, handler):
