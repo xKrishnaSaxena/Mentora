@@ -1,6 +1,5 @@
 aiohttp
-pyautogui
-opencv-python
+opencv-python-headless
 numpy
 websockets
 pytesseract
@@ -13,6 +12,7 @@ PyJWT
 bcrypt
 motor
 langchain_community
+langchain-text-splitters
 langchain-google-genai>=0.1.0
 langchain
 pypdf
