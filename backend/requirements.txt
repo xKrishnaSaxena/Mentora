@@ -13,8 +13,10 @@ PyJWT
 bcrypt
 motor
 langchain_community
-langchain_google_genai
+langchain-google-genai>=0.1.0
 langchain
 pypdf
 pymilvus
 aiohttp_cors
+faiss-cpu
+edge_tts

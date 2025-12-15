@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect } from "react";
 import React, { Children, isValidElement } from "react";
 import {
   Send,
@@ -8,7 +8,6 @@ import {
   Check,
   Copy,
   BookmarkPlus,
-  Sparkles,
   Bot,
   User,
 } from "lucide-react";
@@ -27,13 +26,9 @@ import "prismjs/components/prism-csharp";
 import "prismjs/components/prism-css";
 import "prismjs/components/prism-json";
 
-const MAX_RECONNECT_ATTEMPTS = 5;
-const RECONNECT_DELAY = 3000;
-const RESTART_GRACE_MS = 1000; // wait this long after audio ends
-// true while TTS is speaking (and a bit after)
+const RESTART_GRACE_MS = 500; // Reduced slightly for snappier response
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8765";
-const WS_BASE = import.meta.env.VITE_WS_BASE || API_BASE.replace(/^http/, "ws");
 
 const MODE_LABELS = {
   teach: "Teach",
@@ -56,7 +51,7 @@ function highlight(code, lang) {
   return Prism.highlight(code, grammar, lang);
 }
 
-/* Mermaid renderer for ```mermaid blocks inside details */
+/* Mermaid renderer helpers */
 function escapeHtml(s) {
   return s.replace(
     /[&<>"']/g,
@@ -69,22 +64,17 @@ function escapeHtml(s) {
 
 function sanitizeMermaid(code) {
   let c = code || "";
-
-  // strip accidental inner ``` fences
   c = c.replace(/^\s*```+mermaid\s*/i, "").replace(/```+\s*$/i, "");
-
-  // normalize quotes/dashes/arrows and whitespace
   c = c
     .replace(/[“”]/g, '"')
     .replace(/[‘’]/g, "'")
     .replace(/[–—]/g, "-")
-    .replace(/\u2192/g, "-->") // →
-    .replace(/\u2190/g, "<--") // ←
-    .replace(/-{1,2}>/g, "-->") // -> or --> -> -->
-    .replace(/<-{1,2}/g, "<--") // <- or <-- -> <--
+    .replace(/\u2192/g, "-->")
+    .replace(/\u2190/g, "<--")
+    .replace(/-{1,2}>/g, "-->")
+    .replace(/<-{1,2}/g, "<--")
     .replace(/\t/g, "  ");
 
-  // ensure header present
   const lines = c.split("\n");
   const firstNonEmpty = (lines.find((l) => l.trim().length) || "").trim();
   const hasHeader =
@@ -92,7 +82,6 @@ function sanitizeMermaid(code) {
       firstNonEmpty
     );
   if (!hasHeader) c = "flowchart TD\n" + c;
-
   return c.trim();
 }
 
@@ -108,10 +97,8 @@ function Mermaid({ code }) {
 
   useEffect(() => {
     let cancelled = false;
-
     mermaid.initialize({
       startOnLoad: false,
-      // keep "loose" if you embed HTML/links; use "strict" if you want max safety
       securityLevel: "loose",
       theme: "dark",
       deterministicIds: true,
@@ -120,10 +107,7 @@ function Mermaid({ code }) {
     (async () => {
       try {
         const cleaned = sanitizeMermaid(code);
-        if (!looksLikeMermaid(cleaned))
-          throw new Error("Not a Mermaid diagram");
-
-        // Validate first. If invalid, try a last-resort header prepend.
+        if (!looksLikeMermaid(cleaned)) throw new Error("Not a Mermaid diagram");
         try {
           await mermaid.parse(cleaned);
         } catch (e) {
@@ -132,14 +116,12 @@ function Mermaid({ code }) {
             : "flowchart TD\n" + cleaned;
           await mermaid.parse(patched);
         }
-
         const id = "mmd-" + Math.random().toString(36).slice(2);
         const { svg } = await mermaid.render(id, cleaned);
         if (!cancelled && containerRef.current) {
           containerRef.current.innerHTML = svg;
         }
       } catch (e) {
-        // Graceful fallback: show raw code, never throw
         if (!cancelled && containerRef.current) {
           containerRef.current.innerHTML = `<pre class="rounded-lg overflow-x-auto bg-[#0c0f17] border border-white/10 p-3"><code>${escapeHtml(
             code || ""
@@ -147,7 +129,6 @@ function Mermaid({ code }) {
         }
       }
     })();
-
     return () => {
       cancelled = true;
       if (containerRef.current) containerRef.current.innerHTML = "";
@@ -156,6 +137,7 @@ function Mermaid({ code }) {
 
   return <div ref={containerRef} className="max-w-full overflow-x-auto" />;
 }
+
 function CodeBlock({ raw, lang }) {
   const html = React.useMemo(() => highlight(raw, lang), [raw, lang]);
   return (
@@ -165,12 +147,10 @@ function CodeBlock({ raw, lang }) {
   );
 }
 
-/* Markdown renderer used in Details */
 function DetailsMarkdown({ content }) {
   return (
     <div className="prose prose-invert max-w-none prose-pre:my-0">
       <ReactMarkdown
-        // 1) Block code lives here
         components={{
           pre({ children }) {
             const arr = Children.toArray(children);
@@ -191,24 +171,19 @@ function DetailsMarkdown({ content }) {
             }
             return <CodeBlock raw={raw} lang={lang} />;
           },
-
-          // 2) Inline code stays inline only
           code({ inline, className, children, ...props }) {
-            // IMPORTANT: never return <pre> here
             return (
               <code className="bg-white/10 px-1.5 py-0.5 rounded" {...props}>
                 {children}
               </code>
             );
           },
-
-          // 3) (Optional hardening) If a paragraph ends up with a lone <pre>, unwrap it
           p({ children, ...props }) {
             const arr = Children.toArray(children);
             if (arr.length === 1) {
               const child = arr[0];
               if (isValidElement(child) && child.type === "pre") {
-                return child; // unwrap lone <pre> inside a <p>
+                return child;
               }
             }
             return <p {...props}>{children}</p>;
@@ -248,167 +223,32 @@ export default function ChatInterface({
 
   const [currentFrame, setCurrentFrame] = useState(null);
 
-  const ws = useRef(null);
+  // Refs
   const messagesEndRef = useRef(null);
   const recognitionRef = useRef(null);
-  const audioElRef = useRef(null); // DOM <audio>, improves autoplay reliability
+  const audioElRef = useRef(null);
   const screenShareTrackRef = useRef(null);
   const asrLockedRef = useRef(false);
+  
+  // NEW: Track voice mode in a ref to avoid stale closures during async audio playback
+  const voiceModeRef = useRef(isVoiceModeActive);
+
   /* scroll */
   const scrollToBottom = () =>
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
 
-  /* WS connect */
-  const connectWebSocket = useCallback(
-    (attempt = 0) => {
-      if (
-        ws.current &&
-        [WebSocket.OPEN, WebSocket.CONNECTING].includes(ws.current.readyState)
-      )
-        return;
-
-      const token = localStorage.getItem("authToken");
-      if (!token) {
-        setConnectionError("Please log in to continue.");
-        setTimeout(() => onNavigate?.("login"), 800);
-        return;
-      }
-
-      ws.current = new WebSocket(
-        `${WS_BASE}/ws?token=${encodeURIComponent(token)}`
-      );
-      let reconnectTimer = null;
-
-      ws.current.onopen = () => {
-        if (reconnectTimer) clearTimeout(reconnectTimer);
-        setConnectionError(null);
-      };
-
-      ws.current.onmessage = async (event) => {
-        try {
-          const data = JSON.parse(event.data);
-
-          if (data?.error && String(data.error).includes("Invalid token")) {
-            setConnectionError("Session expired. Please log in again.");
-            localStorage.removeItem("authToken");
-            setTimeout(() => onNavigate?.("login"), 800);
-            return;
-          }
-          setIsGenerating(false);
-
-          // push assistant message
-          setMessages((prev) => [
-            ...prev,
-            {
-              type: "assistant",
-              text: data.text ?? "",
-              detailed: data.detailed ?? "",
-              responseType: data.responseType ?? "answer",
-              mode: data.mode ?? selectedMode,
-              quiz: data.quiz ?? null,
-            },
-          ]);
-
-          // play audio if provided (for voice mode)
-          if (data.audio) {
-            // fully gate ASR during playback
-            asrLockedRef.current = true;
-            stopRecognition(true); // abort immediately
-
-            if (audioElRef.current) {
-              audioElRef.current.pause();
-              audioElRef.current.src = "";
-            }
-
-            const a = audioElRef.current;
-            a.src = URL.createObjectURL(base64ToBlob(data.audio, "audio/mp3"));
-
-            const unlock = () => {
-              setIsPlayingAudio(false);
-              // give the browser a moment to stop routing output audio to the mic
-              setTimeout(() => {
-                asrLockedRef.current = false;
-                if (isVoiceModeActive) startRecognition();
-              }, RESTART_GRACE_MS);
-              a.removeEventListener("ended", unlock);
-              a.removeEventListener("error", unlock);
-            };
-
-            a.addEventListener("ended", unlock);
-            a.addEventListener("error", unlock);
-
-            try {
-              setIsPlayingAudio(true);
-              await a.play();
-              setVoiceStatus("Playing response…");
-            } catch {
-              setIsPlayingAudio(false);
-              // could not autoplay – still keep ASR locked for a beat, then resume
-              unlock();
-            }
-          }
-        } catch {
-          setConnectionError("Error processing server response.");
-        } finally {
-          scrollToBottom();
-        }
-      };
-
-      ws.current.onerror = () => {
-        setIsGenerating(false);
-        setConnectionError("Connection problem. Reconnecting…");
-
-        if (
-          ![WebSocket.CLOSED, WebSocket.CLOSING].includes(
-            ws.current?.readyState
-          )
-        ) {
-          ws.current?.close();
-        }
-      };
-
-      ws.current.onclose = (e) => {
-        if (e.code === 1008 && String(e.reason).includes("Invalid token")) {
-          setIsGenerating(false);
-          setConnectionError("Session expired. Please log in again.");
-          localStorage.removeItem("authToken");
-          setTimeout(() => onNavigate?.("login"), 800);
-          return;
-        }
-        if (attempt < MAX_RECONNECT_ATTEMPTS) {
-          reconnectTimer = setTimeout(
-            () => connectWebSocket(attempt + 1),
-            RECONNECT_DELAY
-          );
-        } else {
-          setConnectionError("Unable to connect to server.");
-        }
-      };
-    },
-    [onNavigate, isVoiceModeActive, selectedMode]
-  );
-
+  /* Sync Ref with State */
   useEffect(() => {
-    connectWebSocket();
-    return () => {
-      if (ws.current?.readyState === WebSocket.OPEN)
-        ws.current.close(1000, "unmount");
-      stopRecognition();
-      if (audioElRef.current) {
-        audioElRef.current.pause();
-        audioElRef.current.src = "";
-      }
-      if (screenShareTrackRef.current) screenShareTrackRef.current.stop();
-    };
-  }, [connectWebSocket]);
+    voiceModeRef.current = isVoiceModeActive;
+  }, [isVoiceModeActive]);
 
+  /* Load history */
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
   useEffect(() => {
     if (!chatId) return;
-
-    // local first
     const cached = localStorage.getItem(`chat:${chatId}`);
     if (cached) {
       try {
@@ -418,12 +258,17 @@ export default function ChatInterface({
       setMessages([]);
     }
 
-    // canonical server history
     const token = localStorage.getItem("authToken");
     fetch(`${API_BASE}/chats/${chatId}/messages`, {
       headers: { Authorization: `Bearer ${token}` },
     })
-      .then((r) => (r.ok ? r.json() : []))
+      .then((r) => {
+        if (r.status === 401) {
+          onNavigate?.("login");
+          return [];
+        }
+        return r.ok ? r.json() : [];
+      })
       .then((data) =>
         setMessages(
           data.map((m) => ({
@@ -431,21 +276,23 @@ export default function ChatInterface({
             text: m.text || "",
             detailed: m.detailed || "",
             mode: m.mode || "teach",
+            quiz: m.quiz || null,
           }))
         )
       )
       .catch(() => {});
-  }, [chatId]);
+  }, [chatId, onNavigate]);
 
-  // Persist
   useEffect(() => {
     if (!chatId) return;
     localStorage.setItem(`chat:${chatId}`, JSON.stringify(messages));
   }, [messages, chatId]);
 
-  /* ASR */
-  const startRecognition = () => {
-    if (asrLockedRef.current || isPlayingAudio) return;
+  /* ASR Logic */
+  const startRecognition = (force = false) => {
+    // If not forced, check locks. If forced (audio just ended), ignore locks.
+    if (!force && (asrLockedRef.current || isPlayingAudio)) return;
+
     if (
       !("SpeechRecognition" in window || "webkitSpeechRecognition" in window)
     ) {
@@ -465,19 +312,24 @@ export default function ChatInterface({
         setVoiceStatus("Listening…");
       };
       rec.onresult = (e) => {
-        if (asrLockedRef.current || isPlayingAudio) return; // <-- drop late/echoed results
+        // Double check lock in case audio started simultaneously
+        if (asrLockedRef.current) return; 
         const transcript = e.results[e.results.length - 1][0].transcript;
         setInputText("");
         handleSendMessage(transcript, true);
       };
       rec.onend = () => {
         setIsRecognitionActive(false);
-        if (isVoiceModeActive && !isPlayingAudio) startRecognition();
-        else setVoiceStatus("");
+        // Use the ref here to ensure we restart based on current intent
+        if (voiceModeRef.current && !asrLockedRef.current) {
+            startRecognition();
+        } else {
+            setVoiceStatus("");
+        }
       };
       rec.onerror = (e) => {
         setVoiceStatus(`ASR error: ${e.error}`);
-        if (e.error === "no-speech" && isVoiceModeActive)
+        if (e.error === "no-speech" && voiceModeRef.current)
           setTimeout(startRecognition, 350);
         if (["not-allowed", "service-not-allowed"].includes(e.error)) {
           setIsVoiceModeActive(false);
@@ -521,7 +373,7 @@ export default function ChatInterface({
     }
   };
 
-  /* Screen share only for Learn mode */
+  /* Screen Share */
   async function startScreenShare() {
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
@@ -571,46 +423,120 @@ export default function ChatInterface({
     }
   }
 
-  /* send */
-  const handleSendMessage = (text = inputText, isVoice = false) => {
+  /* Handle Send */
+  const handleSendMessage = async (text = inputText, isVoice = false) => {
     const question = (text || "").trim();
     if (!question) return;
 
-    // show user bubble
+    const token = localStorage.getItem("authToken");
+    if (!token) {
+      setConnectionError("Please log in.");
+      onNavigate?.("login");
+      return;
+    }
+
     setMessages((prev) => [
       ...prev,
       { type: "user", text: question, mode: isVoice ? "voice" : "text" },
     ]);
-    setIsGenerating(true);
-    // build compact history
-    const history = [...messages, { type: "user", text: question }].map(
-      (m) => ({
-        role: m.type === "assistant" ? "assistant" : "user",
-        content: m.text || m.detailed || "",
-      })
-    );
-
-    // only attach frame when in learn mode
-    const framePayload = selectedMode === "learn" ? currentFrame : null;
-
-    if (ws.current?.readyState === WebSocket.OPEN) {
-      ws.current.send(
-        JSON.stringify({
-          type: isVoice ? "voice_query" : "text_query",
-          chatId,
-          question,
-          frame: framePayload,
-          mode: selectedMode,
-          category,
-          history,
-        })
-      );
-    } else {
-      setConnectionError("Cannot send message. Server unavailable.");
-      setTimeout(() => setConnectionError(null), 2000);
-    }
-
     setInputText("");
+    setIsGenerating(true);
+    setConnectionError(null);
+
+    const framePayload = selectedMode === "learn" ? currentFrame : null;
+    const payload = {
+      type: isVoice ? "voice_query" : "text_query",
+      chatId,
+      question,
+      frame: framePayload,
+      mode: selectedMode,
+      category,
+    };
+
+    try {
+      const res = await fetch(`${API_BASE}/chat/interaction`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (res.status === 401) {
+        setConnectionError("Session expired. Please log in.");
+        localStorage.removeItem("authToken");
+        onNavigate?.("login");
+        return;
+      }
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || "Server error");
+      }
+
+      const data = await res.json();
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          type: "assistant",
+          text: data.text ?? "",
+          detailed: data.detailed ?? "",
+          responseType: data.responseType ?? "answer",
+          mode: data.mode ?? selectedMode,
+          quiz: data.quiz ?? null,
+        },
+      ]);
+
+      if (data.audio) {
+        // Lock mic
+        asrLockedRef.current = true;
+        stopRecognition(true);
+
+        if (audioElRef.current) {
+          audioElRef.current.pause();
+          audioElRef.current.src = "";
+        }
+
+        const a = audioElRef.current;
+        a.src = URL.createObjectURL(base64ToBlob(data.audio, "audio/mp3"));
+
+        const unlock = () => {
+          setIsPlayingAudio(false);
+          // Unlock after grace period
+          setTimeout(() => {
+            asrLockedRef.current = false;
+            // CHECK THE REF (live value) NOT THE VARIABLE (captured value)
+            if (voiceModeRef.current) {
+                startRecognition(true); // Force start
+            } else {
+                setVoiceStatus(""); // Clear "Playing response..." if not listening
+            }
+          }, RESTART_GRACE_MS);
+          
+          a.removeEventListener("ended", unlock);
+          a.removeEventListener("error", unlock);
+        };
+
+        a.addEventListener("ended", unlock);
+        a.addEventListener("error", unlock);
+
+        try {
+          setIsPlayingAudio(true);
+          setVoiceStatus("Playing response…"); // Set status immediately
+          await a.play();
+        } catch {
+          setIsPlayingAudio(false);
+          unlock();
+        }
+      }
+    } catch (err) {
+      setConnectionError(err.message || "Failed to send message");
+    } finally {
+      setIsGenerating(false);
+      scrollToBottom();
+    }
   };
 
   const copyToClipboard = async (str) => {
@@ -636,14 +562,15 @@ export default function ChatInterface({
     });
     onNavigate?.("notes");
   };
+
   function SpinnerDot() {
     return (
       <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-white/25 border-t-white/70" />
     );
   }
+
   return (
     <div className="flex h-full w-full min-h-0 flex-col rounded-2xl bg-[#0b0f19] text-slate-100 border border-white/5 shadow-[0_10px_30px_-12px_rgba(0,0,0,0.35)] overflow-hidden">
-      {/* hidden audio element for reliable playback */}
       <audio ref={audioElRef} hidden />
 
       {/* Header */}
@@ -654,7 +581,6 @@ export default function ChatInterface({
             <span className="opacity-90">{category}</span>
           </div>
 
-          {/* mode selector */}
           <div className="relative ml-2">
             <button
               className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-xs hover:bg-white/10"
@@ -671,7 +597,7 @@ export default function ChatInterface({
                     onClick={() => {
                       setSelectedMode(k);
                       setShowModeMenu(false);
-                      if (k !== "learn") setCurrentFrame(null); // drop frame when leaving learn
+                      if (k !== "learn") setCurrentFrame(null);
                     }}
                   >
                     <span>{v}</span>
@@ -820,7 +746,7 @@ export default function ChatInterface({
                   className="flex-1 h-11 overflow-y-auto resize-none bg-transparent text-sm text-slate-100 placeholder:text-slate-400 outline-none px-2 py-1.5"
                 />
                 <div className="flex items-center gap-1">
-                  {/* mic toggle always available */}
+                  {/* mic toggle */}
                   <button
                     className={`inline-flex items-center justify-center rounded-xl border border-white/10 px-2.5 py-2 ${
                       isVoiceModeActive
@@ -833,7 +759,7 @@ export default function ChatInterface({
                     <Mic size={16} />
                   </button>
 
-                  {/* screen share ONLY in Learn mode */}
+                  {/* screen share */}
                   {selectedMode === "learn" && (
                     <button
                       className={`inline-flex items-center justify-center rounded-xl border border-white/10 bg-white/5 px-2.5 py-2 text-slate-200 hover:bg-white/10 ${

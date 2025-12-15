@@ -42,7 +42,7 @@ if not MONGODB_URI:
 
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel(
-    "gemini-1.5-flash",
+    "gemini-2.5-flash",
     system_instruction=(
         "You are an AI assistant. Your task is to answer questions based on provided text or generate content as requested. "
         "For concise responses, use only spaces for formatting—no asterisks or special characters. "
@@ -81,7 +81,7 @@ async def initialize_pdf_rag():
             raise ValueError("❌ Text splitter produced no chunks")
 
         embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004",
+            model="models/gemini-embedding-001",
             google_api_key=GEMINI_API_KEY,
         )
 
@@ -165,19 +165,6 @@ async def text_to_speech(text: str, tts_opts=None):
         logger.error(f"TTS error: {e}")
         return None
 
-# async def text_to_speech(text: str):
-#     try:
-#         tts = gTTS(text=text, lang="en")
-#         mp3_fp = io.BytesIO()
-#         tts.write_to_fp(mp3_fp)
-#         mp3_fp.seek(0)
-#         audio_data = base64.b64encode(mp3_fp.read()).decode("utf-8")
-#         logger.info("Audio generated successfully")
-#         return audio_data
-#     except Exception as e:
-#         logger.error(f"Text-to-speech error: {str(e)}")
-#         return None
-
 def process_frame(frame_data: str):
     try:
         frame_bytes = base64.b64decode(frame_data)
@@ -214,10 +201,8 @@ def to_concise_plain(text: str, max_sentences: int = 2) -> str:
     - keep up to N sentences
     """
     s = strip_fenced_blocks(text or "")
-    s = clean_text(s)  # your existing markdown cleaner (bold/italics/inline code etc.)
-    # collapse whitespace
+    s = clean_text(s) 
     s = re.sub(r"\s+", " ", s).strip()
-    # limit sentences
     parts = re.split(r"(?<=[.!?])\s+", s)
     s2 = " ".join(parts[:max_sentences]).strip()
     return s2 or s
@@ -241,7 +226,6 @@ async def handle_rag_mode(data):
     docs = vector_store.similarity_search(question, k=3)
     context = "\n\n".join([doc.page_content for doc in docs])
 
-    # Ask for JSON so we can separate concise/detailed cleanly
     prompt = f"""
 You are an expert AI tutor helping students understand concepts from their textbook.
 {memory_text}
@@ -650,131 +634,113 @@ async def login_handler(request):
         return web.json_response({"token": token})
     else:
         return web.Response(status=401, text="Invalid credentials")
+async def chat_interaction(request):
+    """
+    Replaces the websocket_handler. 
+    Receives JSON payload, processes AI response, saves to DB, returns JSON.
+    """
+    user_id = request["user_id"]
+    try:
+        data = await request.json()
+    except:
+        return web.Response(status=400, text="Invalid JSON")
 
-async def websocket_handler(request):
-    token = request.query.get("token")
-    if token:
-        try:
-            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-            user_id = payload["user_id"]
-        except jwt.InvalidTokenError:
-            return web.Response(status=401, text="Invalid token")
-    else:
-        return web.Response(status=401, text="Missing token")
+    chat_id = data.get("chatId")
+    if not chat_id:
+        return web.json_response({"error": "Missing chatId"}, status=400)
 
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-    ws.user_id = user_id
     db = request.app["db"]
+    chat = await db.chats.find_one({"_id": ObjectId(chat_id), "userId": ObjectId(user_id)})
+    if not chat:
+        return web.json_response({"error": "Chat not found"}, status=404)
 
-    async for msg in ws:
-        if msg.type != WSMsgType.TEXT:
-            continue
+    mode = data.get("mode", "teach")
+    question = (data.get("question") or "").strip()
+    
+    if not question:
+        return web.json_response({"error": "Empty question"}, status=400)
 
-        data = json.loads(msg.data)
-        chat_id = data.get("chatId")
-        if not chat_id:
-            await ws.send_json({"error": "Missing chatId"})
-            continue
+    await db.messages.insert_one({
+        "chatId": ObjectId(chat_id),
+        "userId": ObjectId(user_id),
+        "role": "user",
+        "content": question,
+        "detailed": "",
+        "mode": mode,
+        "createdAt": datetime.now(timezone.utc),
+    })
 
-        chat = await db.chats.find_one({"_id": ObjectId(chat_id), "userId": ObjectId(user_id)})
-        if not chat:
-            await ws.send_json({"error": "Chat not found"})
-            continue
+    cur = db.messages.find({"chatId": ObjectId(chat_id), "userId": ObjectId(user_id)}).sort("createdAt", 1)
+    history_docs = [x async for x in cur][-30:] 
+    
+    history = [{"role": d["role"], "content": d["content"] or d.get("detailed","")} for d in history_docs]
+    memory = chat.get("memory", "")
 
-        mode = data.get("mode", "teach")
-        question = (data.get("question") or "").strip()
-        if not question:
-            await ws.send_json({"error": "Empty question"})
-            continue
+    payload = {
+        "question": question,
+        "history": history,
+        "mode": mode,
+        "category": data.get("category", ""),
+        "frame": data.get("frame"),
+        "memory": memory,
+    }
 
-        
+    if mode == "learn":
+        response_data = await handle_learn_mode(payload)
+    elif mode == "teach":
+        response_data = await handle_teach_mode(payload)
+    elif mode == "quiz":
+        response_data = await handle_quiz_mode(payload)
+    elif mode == "rag":
+        response_data = await handle_rag_mode(payload)
+    else:
+        response_data = {"error": "Invalid mode"}
+
+    if not response_data.get("error"):
         await db.messages.insert_one({
             "chatId": ObjectId(chat_id),
             "userId": ObjectId(user_id),
-            "role": "user",
-            "content": question,
-            "detailed": "",
-            "mode": mode,
+            "role": "assistant",
+            "content": response_data.get("text",""),
+            "detailed": response_data.get("detailed",""),
+            "mode": response_data.get("mode", mode),
+            "quiz": response_data.get("quiz"), 
             "createdAt": datetime.now(timezone.utc),
         })
-
         
-        cur = db.messages.find({"chatId": ObjectId(chat_id), "userId": ObjectId(user_id)}).sort("createdAt", 1)
-        history_docs = [x async for x in cur][-30:]   
-        memory = chat.get("memory", "")
+        await db.chats.update_one(
+            {"_id": ObjectId(chat_id)},
+            {"$set": {"updatedAt": datetime.now(timezone.utc)}}
+        )
 
-        
-        history = [{"role": d["role"], "content": d["content"] or d.get("detailed","")} for d in history_docs]
-
-        
-        payload = {
-            "question": question,
-            "history": history,
-            "mode": mode,
-            "category": data.get("category", ""),
-            "frame": data.get("frame"),
-            "memory": memory,
-        }
-
-        if mode == "learn":
-            response_data = await handle_learn_mode(payload)
-        elif mode == "teach":
-            response_data = await handle_teach_mode(payload)
-        elif mode == "quiz":
-            response_data = await handle_quiz_mode(payload)
-        elif mode == "rag":
-            response_data = await handle_rag_mode(payload)
-        else:
-            response_data = {"error": "Invalid mode"}
-
-        # 4) store assistant message
-        if not response_data.get("error"):
-            await db.messages.insert_one({
-                "chatId": ObjectId(chat_id),
-                "userId": ObjectId(user_id),
-                "role": "assistant",
-                "content": response_data.get("text",""),
-                "detailed": response_data.get("detailed",""),
-                "mode": response_data.get("mode", mode),
-                "createdAt": datetime.now(timezone.utc),
-            })
-            await db.chats.update_one(
-                {"_id": ObjectId(chat_id)},
-                {"$set": {"updatedAt": datetime.now(timezone.utc)}}
-            )
-
-        # 5) optional: lightweight memory update every 8 user turns
         turns = sum(1 for d in history_docs if d["role"] == "user")
-        if turns % 8 == 0:
-            try:
-                mem_prompt = f"""Summarize the stable facts, user preferences, goals, and constraints from this chat.
+        if turns > 0 and turns % 8 == 0:
+            asyncio.create_task(update_memory_background(db, chat_id, history))
+
+        if data.get("type") == "voice_query":
+            audio_base64 = await text_to_speech(response_data["text"])
+            if audio_base64:
+                response_data["audio"] = audio_base64
+
+    return web.json_response(response_data)
+
+async def update_memory_background(db, chat_id, history):
+    """Helper to update memory without blocking the HTTP response"""
+    try:
+        mem_prompt = f"""Summarize the stable facts, user preferences, goals, and constraints from this chat.
 Return 5-10 bullet points, concise. Avoid transient details.
 History:
 {json.dumps(history[-40:], ensure_ascii=False, indent=2)}
 """
-                mem_resp = model.generate_content(mem_prompt)
-                new_mem = (mem_resp.text or "").strip()
-                if new_mem:
-                    await db.chats.update_one(
-                        {"_id": ObjectId(chat_id)},
-                        {"$set": {"memory": new_mem}}
-                    )
-            except Exception as _:
-                pass
-
-        # 6) TTS (unchanged)
-        if data.get("type") == "voice_query" and not response_data.get("error"):
-            audio_base64 = await text_to_speech(response_data["text"])
-            if audio_base64:
-                response_data["audio"] = audio_base64
-            else:
-                response_data["error"] = "Failed to generate audio"
-
-        await ws.send_json(response_data)
-
-    await ws.close()
-    return ws
+        mem_resp = model.generate_content(mem_prompt)
+        new_mem = (mem_resp.text or "").strip()
+        if new_mem:
+            await db.chats.update_one(
+                {"_id": ObjectId(chat_id)},
+                {"$set": {"memory": new_mem}}
+            )
+    except Exception as e:
+        logger.error(f"Memory update failed: {e}")
 
 async def health_check(request):
     return web.Response(text="OK", status=200)
@@ -795,7 +761,7 @@ async def start_server():
         {"path": "/", "handler": root_handler, "method": "GET", "allow_methods": ["GET"]},
         {"path": "/register", "handler": register_handler, "method": "POST", "allow_methods": ["POST"]},
         {"path": "/login", "handler": login_handler, "method": "POST", "allow_methods": ["POST"]},
-        {"path": "/ws", "handler": websocket_handler, "method": "GET", "allow_methods": ["GET"]},
+        {"path": "/chat/interaction", "handler": chat_interaction, "method": "POST", "allow_methods": ["POST"]},
         {"path": "/chats", "handler": create_chat, "method": "POST", "allow_methods": ["POST"]},
         {"path": "/chats", "handler": list_chats, "method": "GET", "allow_methods": ["GET"]},
         {"path": "/chats/{chat_id}", "handler": rename_chat, "method": "PATCH", "allow_methods": ["PATCH"]},
