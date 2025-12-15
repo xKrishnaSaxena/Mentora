@@ -6,7 +6,7 @@ export default function ChatSidebar({ token, activeChatId, onSelectChat }) {
   const headers = { Authorization: `Bearer ${token}` };
 
   const load = async () => {
-    const r = await fetch("http://localhost:8765/chats", { headers });
+    const r = await fetch("https://mentora-backend-kfgy.onrender.com/chats", { headers });
     if (!r.ok) return;
     const data = await r.json();
     setChats(data);
@@ -25,7 +25,7 @@ export default function ChatSidebar({ token, activeChatId, onSelectChat }) {
   }, []);
 
   const newChat = async () => {
-    const r = await fetch("http://localhost:8765/chats", {
+    const r = await fetch("https://mentora-backend-kfgy.onrender.com/chats", {
       method: "POST",
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({ title: "New chat", mode: "teach" }),
@@ -39,7 +39,7 @@ export default function ChatSidebar({ token, activeChatId, onSelectChat }) {
   const renameChat = async (id) => {
     const title = prompt("Rename chat:");
     if (!title) return;
-    await fetch(`http://localhost:8765/chats/${id}`, {
+    await fetch(`https://mentora-backend-kfgy.onrender.com/chats/${id}`, {
       method: "PATCH",
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({ title }),
@@ -49,7 +49,7 @@ export default function ChatSidebar({ token, activeChatId, onSelectChat }) {
 
   const deleteChat = async (id) => {
     if (!confirm("Delete chat?")) return;
-    await fetch(`http://localhost:8765/chats/${id}`, {
+    await fetch(`https://mentora-backend-kfgy.onrender.com/chats/${id}`, {
       method: "DELETE",
       headers,
     });

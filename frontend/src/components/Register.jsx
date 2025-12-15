@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8765";
+const API_BASE = "https://mentora-backend-kfgy.onrender.com";
 
 export default function Register({ onSwitch }) {
   const [form, setForm] = useState({
