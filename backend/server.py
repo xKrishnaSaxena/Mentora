@@ -64,7 +64,7 @@ async def initialize_pdf_rag():
     if pdf_initialized:
         return
 
-    collection_name = "foxlearner_ch6_embeddings"
+    collection_name = "mentora_embeddings"
     try:
         current_dir = os.path.dirname(__file__)
         pdf_path = os.path.join(current_dir, "lecs105.pdf")
